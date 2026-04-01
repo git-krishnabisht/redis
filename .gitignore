@@ -1,0 +1,25 @@
+# Build output
+build/
+.gradle/
+
+# Local configuration (machine-specific, contains SDK paths)
+local.properties
+
+# IDE files
+.idea/
+*.iml
+*.iws
+*.ipr
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Kotlin compilation
+*.class
+*.jar
+*.war
+*.aar
+
+# Logs
+*.log
