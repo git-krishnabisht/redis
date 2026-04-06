@@ -5,17 +5,23 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.locks.Condition
 import java.util.concurrent.locks.ReentrantLock
 
-data class EntrySTRINGS (
+data class STRINGS (
     val value: String,
     val exp: Long? = null
 )
 
-data class EntryLISTS (
+data class LISTS (
     val exp: Long? = null
 ) {
-    val rpushList: MutableList<String> = mutableListOf()
+    val redisList: MutableList<String> = mutableListOf()
     val lock = ReentrantLock()
     val notEmpty: Condition = lock.newCondition()
+}
+
+data class STREAM (
+    val exp: Long? = null
+) {
+    val redisStream: MutableMap<String,MutableMap<String, String>> = mutableMapOf()
 }
 
 const val OK = "+OK\r\n"
@@ -48,7 +54,7 @@ fun eCHO (
 fun sET (
     output: OutputStream,
     parts: MutableList<String>,
-    cacheStrings: ConcurrentHashMap<String, EntrySTRINGS>
+    stringContainer: ConcurrentHashMap<String, STRINGS>
 ) {
     val setKey = parts.getOrNull(1) ?: ""
     val setValue = parts.getOrNull(2) ?: ""
@@ -67,17 +73,17 @@ fun sET (
     } else {
         null
     }
-    cacheStrings[setKey] = EntrySTRINGS(value = setValue, exp = setExp)
+    stringContainer[setKey] = STRINGS(value = setValue, exp = setExp)
     writeOutput(output, OK)
 }
 
 fun gET (
     output: OutputStream,
     parts: MutableList<String>,
-    cacheStrings: ConcurrentHashMap<String, EntrySTRINGS>
+    stringContainer: ConcurrentHashMap<String, STRINGS>
 ) {
     val getKey = parts.getOrNull(1) ?: ""
-    val entry = cacheStrings[getKey]
+    val entry = stringContainer[getKey]
     val response: String
 
     if (entry == null) {
@@ -87,7 +93,7 @@ fun gET (
         val exp = entry.exp
 
         if (exp != null && now >= exp) {
-            cacheStrings.remove(getKey, entry)
+            stringContainer.remove(getKey, entry)
             response = NULL_BULK
         } else {
             response = "$${entry.value.length}\r\n${entry.value}\r\n"
@@ -100,22 +106,22 @@ fun gET (
 fun rPUSH (
     output: OutputStream,
     parts: MutableList<String>,
-    cacheList: ConcurrentHashMap<String, EntryLISTS>
+    listContainer: ConcurrentHashMap<String, LISTS>
 ) {
     val rpushKey = parts.getOrNull(1) ?: ""
     val rpushValue = parts.drop(2)
 
-    val entry = cacheList.getOrPut(rpushKey) {
-        EntryLISTS()
+    val entry = listContainer.getOrPut(rpushKey) {
+        LISTS()
     }
 
     entry.lock.lock()
     var listLen:Int
 
     try {
-        entry.rpushList.addAll(rpushValue)
+        entry.redisList.addAll(rpushValue)
         entry.notEmpty.signalAll()
-        listLen = entry.rpushList.size
+        listLen = entry.redisList.size
     } finally {
         entry.lock.unlock()
     }
@@ -125,32 +131,32 @@ fun rPUSH (
 }
 
 fun popLeft(
-    entry: EntryLISTS,
+    entry: LISTS,
     blocking: Boolean,
     timeoutMs: Long? = null
 ): String? {
     entry.lock.lock()
     try{
         if (!blocking) {
-            return if (entry.rpushList.isEmpty()) null else entry.rpushList.removeAt(0)
+            return if (entry.redisList.isEmpty()) null else entry.redisList.removeAt(0)
         }
 
         if (timeoutMs == null || timeoutMs == 0L) {
-            while (entry.rpushList.isEmpty()) {
+            while (entry.redisList.isEmpty()) {
                 entry.notEmpty.await()
             }
-            return entry.rpushList.removeAt(0)
+            return entry.redisList.removeAt(0)
         }
 
 
         var nanos = TimeUnit.MILLISECONDS.toNanos(timeoutMs)
 
-        while (entry.rpushList.isEmpty()) {
+        while (entry.redisList.isEmpty()) {
             if (nanos <= 0L) return null
             nanos = entry.notEmpty.awaitNanos(nanos)
         }
 
-        return  entry.rpushList.removeAt(0)
+        return  entry.redisList.removeAt(0)
     } finally {
         entry.lock.unlock()
     }
@@ -159,13 +165,13 @@ fun popLeft(
 fun lPUSH (
     output: OutputStream,
     parts: MutableList<String>,
-    cacheList: ConcurrentHashMap<String, EntryLISTS>
+    listContainer: ConcurrentHashMap<String, LISTS>
 ) {
     val rpushKey = parts.getOrNull(1) ?: ""
     val rpushValue = parts.drop(2)
 
-    val entry = cacheList.getOrPut(rpushKey) {
-        EntryLISTS()
+    val entry = listContainer.getOrPut(rpushKey) {
+        LISTS()
     }
 
     val values: MutableList<String> = mutableListOf()
@@ -175,9 +181,9 @@ fun lPUSH (
     var listLen: Int
 
     try {
-        entry.rpushList.addAll(0, values.reversed())
+        entry.redisList.addAll(0, values.reversed())
         entry.notEmpty.signalAll()
-        listLen = entry.rpushList.size
+        listLen = entry.redisList.size
     } finally {
         entry.lock.unlock()
     }
@@ -189,14 +195,14 @@ fun lPUSH (
 fun lLEN (
     output: OutputStream,
     parts: MutableList<String>,
-    cacheList: ConcurrentHashMap<String, EntryLISTS>
+    listContainer: ConcurrentHashMap<String, LISTS>
 ) {
     val listKey = parts.getOrNull(1) ?: ""
-    val entry = cacheList.getOrPut(listKey) {
-        EntryLISTS()
+    val entry = listContainer.getOrPut(listKey) {
+        LISTS()
     }
 
-    val listLen = entry.rpushList.size
+    val listLen = entry.redisList.size
     val response = if (listLen > 0) {
         ":${listLen}\r\n"
     } else {
@@ -208,12 +214,12 @@ fun lLEN (
 fun lRANGE_POS(
     output: OutputStream,
     parts: MutableList<String>,
-    cacheList: ConcurrentHashMap<String, EntryLISTS>
+    listContainer: ConcurrentHashMap<String, LISTS>
 ) {
     val lrangeKey = parts.getOrNull(1) ?: ""
     val lrangeStartIdx = parts.getOrNull(2)!!.toInt()
     val lrangeStopIdx = parts.getOrNull(3)!!.toInt()
-    val list = cacheList[lrangeKey]?.rpushList ?: mutableListOf()
+    val list = listContainer[lrangeKey]?.redisList ?: mutableListOf()
 
     if (list.isEmpty() || lrangeStartIdx > lrangeStopIdx || lrangeStartIdx >= list.size) {
         writeOutput(output, "*0\r\n")
@@ -236,13 +242,13 @@ fun lRANGE_POS(
 fun lRANGE_NEG(
     output: OutputStream,
     parts: MutableList<String>,
-    cacheList: ConcurrentHashMap<String, EntryLISTS>
+    listContainer: ConcurrentHashMap<String, LISTS>
 ) {
     val lrangeKey = parts.getOrNull(1) ?: ""
     var lrangeStartIdx = parts.getOrNull(2)!!.toInt()
     var lrangeStopIdx = parts.getOrNull(3)!!.toInt()
 
-    val list = cacheList[lrangeKey]!!.rpushList
+    val list = listContainer[lrangeKey]!!.redisList
     val listLen = list.size
 
     lrangeStartIdx = if (lrangeStartIdx < 0) listLen + lrangeStartIdx else lrangeStartIdx
@@ -269,12 +275,12 @@ fun lRANGE_NEG(
 fun lPOP (
     output: OutputStream,
     parts: MutableList<String>,
-    cacheList: ConcurrentHashMap<String, EntryLISTS>
+    listContainer: ConcurrentHashMap<String, LISTS>
 ) {
     val lpopKey = parts.getOrNull(1) ?: ""
 
-    val entry = cacheList.getOrPut(lpopKey) {
-        EntryLISTS()
+    val entry = listContainer.getOrPut(lpopKey) {
+        LISTS()
     }
 
     val value = popLeft(entry, blocking = false)
@@ -291,7 +297,7 @@ fun lPOP (
 fun lPOP_RANGE(
     output: OutputStream,
     parts: MutableList<String>,
-    cacheList: ConcurrentHashMap<String, EntryLISTS>
+    listContainer: ConcurrentHashMap<String, LISTS>
 ) {
     val lpopKey = parts.getOrNull(1) ?: ""
     val lpopRange = parts.getOrNull(2)?.toIntOrNull()
@@ -300,7 +306,7 @@ fun lPOP_RANGE(
         return
     }
 
-    val list = cacheList[lpopKey]?.rpushList
+    val list = listContainer[lpopKey]?.redisList
     if (list.isNullOrEmpty()) {
         writeOutput(output, "*0\r\n")
         return
@@ -333,14 +339,14 @@ fun lPOP_RANGE(
 fun bLPOP(
     output: OutputStream,
     parts: MutableList<String>,
-    cacheList: ConcurrentHashMap<String, EntryLISTS>
+    listContainer: ConcurrentHashMap<String, LISTS>
 ) {
     val lpopKey = parts.getOrNull(1) ?: ""
     val timeoutSeconds = parts.getOrNull(2)?.toDoubleOrNull() ?: 0.0
     val timeoutMs = (timeoutSeconds * 1_000).toLong()
 
-    val entry = cacheList.getOrPut(lpopKey) {
-        EntryLISTS()
+    val entry = listContainer.getOrPut(lpopKey) {
+        LISTS()
     }
 
     val value = popLeft(entry, blocking = true, timeoutMs = timeoutMs)
@@ -354,10 +360,110 @@ fun bLPOP(
     writeOutput(output, response)
 }
 
+fun tYPE(
+    output: OutputStream,
+    parts: MutableList<String>,
+    listContainer: ConcurrentHashMap<String, LISTS>,
+    stringContainer: ConcurrentHashMap<String, STRINGS>,
+    streamContainer: ConcurrentHashMap<String, STREAM>
+) {
+    val typeKey = parts.getOrNull(1) ?: ""
+
+    val stringEntry = stringContainer[typeKey]
+    val listEntry = listContainer[typeKey]
+    val streamEntry = streamContainer[typeKey]
+
+    val response = when {
+        stringEntry != null -> {
+            val exp = stringEntry.exp
+            if (exp != null && System.currentTimeMillis() >= exp) {
+                stringContainer.remove(typeKey, stringEntry)
+                "+none\r\n"
+            } else {
+                "+string\r\n"
+            }
+        }
+        listEntry != null && listEntry.redisList.isNotEmpty() -> "+list\r\n"
+        streamEntry != null && streamEntry.redisStream.isNotEmpty() -> "+stream\r\n"
+        else -> "+none\r\n"
+    }
+
+    writeOutput(output, response)
+}
+
+fun validateStreamEntryIds(
+    xaddEntryId: String,
+    entry: STREAM,
+    output: OutputStream
+): Boolean {
+    val newLeft = xaddEntryId.split("-")[0].toInt()
+    val newRight = xaddEntryId.split("-")[1].toInt()
+
+    if (newLeft == 0 && newRight == 0) {
+        writeOutput(output, "-ERR The ID specified in XADD must be greater than 0-0\r\n")
+        return false
+    }
+
+    val streamIsEmpty = entry.redisStream.isEmpty()
+    if (streamIsEmpty) return true
+
+    val lastEntryId = entry.redisStream.keys.last()
+    val lastLeft = lastEntryId.split("-")[0].toInt()
+    val lastRight = lastEntryId.split("-")[1].toInt()
+
+    if (lastLeft > newLeft) {
+        writeOutput(output, "-ERR The ID specified in XADD is equal or smaller than the target stream top item\r\n")
+        return false
+    } else if (lastLeft == newLeft) {
+        if (newRight > lastRight) {
+            return true
+        }
+        writeOutput(output, "-ERR The ID specified in XADD is equal or smaller than the target stream top item\r\n")
+        return false
+    }
+    return true
+}
+
+
+fun xADD(
+    output: OutputStream,
+    parts: MutableList<String>,
+    streamContainer: ConcurrentHashMap<String, STREAM>
+) {
+    val xaddKey = parts.getOrNull(1)!!
+    val xaddEntryId = parts.getOrNull(2)!!
+    val keyValues = parts.drop(3)
+    val listLen = keyValues.size
+
+    val entry = streamContainer.getOrPut(xaddKey) {
+        STREAM()
+    }
+
+    val valid = validateStreamEntryIds(xaddEntryId, entry, output)
+
+    if (!valid) return
+
+    val entryMap = entry.redisStream.getOrPut(xaddEntryId) { mutableMapOf() }
+
+    var response = ""
+
+    var i = 0
+    while (i + 1 < listLen) {
+        entryMap[keyValues[i]] = keyValues[i + 1]
+        i += 2
+    }
+
+    response = "$${xaddEntryId.length}\r\n${xaddEntryId}\r\n"
+    writeOutput(output, response)
+}
+
+
+
 fun main(args: Array<String>) {
     val server = ServerSocket(6379)
-    val cacheStrings = ConcurrentHashMap<String, EntrySTRINGS>()
-    val cacheList = ConcurrentHashMap<String, EntryLISTS>()
+    val stringContainer = ConcurrentHashMap<String, STRINGS>()
+    val listContainer = ConcurrentHashMap<String, LISTS>()
+    val streamContainer = ConcurrentHashMap<String, STREAM>()
 
     while (true) {
         val conn = server.accept()
@@ -383,26 +489,28 @@ fun main(args: Array<String>) {
                     when (parts.getOrNull(0)?.uppercase()) {
                         "PING" -> pING(output)
                         "ECHO" -> eCHO(output, parts)
-                        "SET" -> sET(output, parts, cacheStrings)
-                        "GET" -> gET(output, parts, cacheStrings)
-                        "LPUSH" -> lPUSH(output, parts, cacheList)
-                        "RPUSH" -> rPUSH(output, parts, cacheList)
+                        "SET" -> sET(output, parts, stringContainer)
+                        "GET" -> gET(output, parts, stringContainer)
+                        "LPUSH" -> lPUSH(output, parts, listContainer)
+                        "RPUSH" -> rPUSH(output, parts, listContainer)
                         "LRANGE" -> {
                             if (parts[2].toInt() >= 0 && parts[3].toInt() > 0){
-                                lRANGE_POS(output, parts, cacheList)
+                                lRANGE_POS(output, parts, listContainer)
                             } else {
-                                lRANGE_NEG(output, parts, cacheList)
+                                lRANGE_NEG(output, parts, listContainer)
                             }
                         }
-                        "LLEN" -> lLEN(output, parts, cacheList)
+                        "LLEN" -> lLEN(output, parts, listContainer)
                         "LPOP" -> {
                             when (parts.size) {
-                                2 -> lPOP(output, parts, cacheList)
-                                3 -> lPOP_RANGE(output, parts, cacheList)
+                                2 -> lPOP(output, parts, listContainer)
+                                3 -> lPOP_RANGE(output, parts, listContainer)
                                 else -> writeOutput(output, "-ERR wrong number of arguments for 'lpop' command\r\n")
                             }
                         }
-                        "BLPOP" -> bLPOP(output, parts, cacheList)
+                        "BLPOP" -> bLPOP(output, parts, listContainer)
+                        "TYPE" -> tYPE(output, parts, listContainer, stringContainer, streamContainer)
+                        "XADD" -> xADD(output, parts, streamContainer)
                     }
                 }
             }
