@@ -1,7 +1,3 @@
-import java.io.OutputStream
-import java.net.ServerSocket
-import java.util.concurrent.ConcurrentHashMap
-
 data class EntrySTRINGS (
     val value: String,
     val exp: Long? = null
@@ -10,13 +6,14 @@ data class EntrySTRINGS (
 data class EntryLISTS (
     val exp: Long? = null
 ) {
-    val rpushList by lazy {
-        mutableListOf<String>()
-    }
+    val rpushList: MutableList<String> = mutableListOf()
+    val lock = ReentrantLock()
+    val notEmpty: Condition = lock.newCondition()
 }
 
 const val OK = "+OK\r\n"
-const val NULL_BULK= "$-1\r\n"
+const val NULL_BULK = "$-1\r\n"
+const val NULL_ARRAY = "*-1\r\n"
 
 fun writeOutput (
     output: OutputStream,
@@ -105,11 +102,51 @@ fun rPUSH (
         EntryLISTS()
     }
 
-    entry.rpushList.addAll(rpushValue)
+    entry.lock.lock()
+    var listLen:Int
 
-    val listLen = entry.rpushList.size
+    try {
+        entry.rpushList.addAll(rpushValue)
+        entry.notEmpty.signalAll()
+        listLen = entry.rpushList.size
+    } finally {
+        entry.lock.unlock()
+    }
+
     val response = ":$listLen\r\n"
     writeOutput(output, response)
+}
+
+fun popLeft(
+    entry: EntryLISTS,
+    blocking: Boolean,
+    timeoutMs: Long? = null
+): String? {
+    entry.lock.lock()
+    try{
+        if (!blocking) {
+            return if (entry.rpushList.isEmpty()) null else entry.rpushList.removeAt(0)
+        }
+
+        if (timeoutMs == null || timeoutMs == 0L) {
+            while (entry.rpushList.isEmpty()) {
+                entry.notEmpty.await()
+            }
+            return entry.rpushList.removeAt(0)
+        }
+
+
+        var nanos = TimeUnit.MILLISECONDS.toNanos(timeoutMs)
+
+        while (entry.rpushList.isEmpty()) {
+            if (nanos <= 0L) return null
+            nanos = entry.notEmpty.awaitNanos(nanos)
+        }
+
+        return  entry.rpushList.removeAt(0)
+    } finally {
+        entry.lock.unlock()
+    }
 }
 
 fun lPUSH (
@@ -127,9 +164,17 @@ fun lPUSH (
     val values: MutableList<String> = mutableListOf()
     values.addAll(rpushValue)
 
-    entry.rpushList.addAll(0, values.reversed())
+    entry.lock.lock()
+    var listLen: Int
 
-    val listLen = entry.rpushList.size
+    try {
+        entry.rpushList.addAll(0, values.reversed())
+        entry.notEmpty.signalAll()
+        listLen = entry.rpushList.size
+    } finally {
+        entry.lock.unlock()
+    }
+
     val response = ":$listLen\r\n"
     writeOutput(output, response)
 }
@@ -225,13 +270,14 @@ fun lPOP (
         EntryLISTS()
     }
 
-    val response = if (entry.rpushList.isEmpty()) {
+    val value = popLeft(entry, blocking = false)
+
+    val response = if (value == null) {
         "$${-1}\r\n"
     } else {
-        "$${entry.rpushList[0].length}\r\n${entry.rpushList[0]}\r\n"
+        "$${value.length}\r\n$value\r\n"
     }
 
-    entry.rpushList.removeFirst()
     writeOutput(output, response)
 }
 
@@ -277,6 +323,30 @@ fun lPOP_RANGE(
     writeOutput(output, response)
 }
 
+fun bLPOP(
+    output: OutputStream,
+    parts: MutableList<String>,
+    cacheList: ConcurrentHashMap<String, EntryLISTS>
+) {
+    val lpopKey = parts.getOrNull(1) ?: ""
+    val timeoutSeconds = parts.getOrNull(2)?.toDoubleOrNull() ?: 0.0
+    val timeoutMs = (timeoutSeconds * 1_000).toLong()
+
+    val entry = cacheList.getOrPut(lpopKey) {
+        EntryLISTS()
+    }
+
+    val value = popLeft(entry, blocking = true, timeoutMs = timeoutMs)
+
+    val response = if (value == null) {
+        NULL_ARRAY
+    } else {
+        "*2\r\n$${lpopKey.length}\r\n$lpopKey\r\n$${value.length}\r\n$value\r\n"
+    }
+
+    writeOutput(output, response)
+}
+
 fun main(args: Array<String>) {
     val server = ServerSocket(6379)
     val cacheStrings = ConcurrentHashMap<String, EntrySTRINGS>()
@@ -311,7 +381,7 @@ fun main(args: Array<String>) {
                         "LPUSH" -> lPUSH(output, parts, cacheList)
                         "RPUSH" -> rPUSH(output, parts, cacheList)
                         "LRANGE" -> {
-                            if (parts[2].toInt() >= 0 && parts[3].toInt() > 0) {
+                            if (parts[2].toInt() >= 0 && parts[3].toInt() > 0){
                                 lRANGE_POS(output, parts, cacheList)
                             } else {
                                 lRANGE_NEG(output, parts, cacheList)
@@ -325,12 +395,14 @@ fun main(args: Array<String>) {
                                 else -> writeOutput(output, "-ERR wrong number of arguments for 'lpop' command\r\n")
                             }
                         }
-                        "BLPOP" -> {
-                            //TODO
-                        }
+                        "BLPOP" -> bLPOP(output, parts, cacheList)
                     }
                 }
             }
         }.start()
     }
 }
+
+
+
+
