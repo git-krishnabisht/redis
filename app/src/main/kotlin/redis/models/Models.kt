@@ -21,3 +21,6 @@ data class STREAM(
 ) {
     val redisStream: MutableMap<String, MutableMap<String, String>> = mutableMapOf()
 }
+
+val TTEM: MutableMap<String, MutableList<String>> = mutableMapOf()
+

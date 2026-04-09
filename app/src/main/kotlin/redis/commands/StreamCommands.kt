@@ -1,6 +1,7 @@
 package redis.commands
 
 import redis.models.STREAM
+import redis.models.TTEM
 import redis.protocol.writeOutput
 import java.io.OutputStream
 import java.util.concurrent.ConcurrentHashMap
@@ -8,6 +9,12 @@ import java.util.concurrent.ConcurrentHashMap
 fun validateStreamEntryIds(xaddEntryId: String, entry: STREAM, output: OutputStream): Boolean {
     val parts = xaddEntryId.split("-")
     val newLeft = parts[0].toInt()
+    val newRightStar = parts[1]
+
+    if (newLeft >= 0 && newRightStar == "*") {
+        return true
+    }
+
     val newRight = parts[1].toInt()
 
     if (newLeft == 0 && newRight == 0) {
@@ -39,18 +46,50 @@ fun xADD(
     parts: MutableList<String>,
     streamContainer: ConcurrentHashMap<String, STREAM>
 ) {
-    val key = parts.getOrNull(1)!!
-    val entryId = parts.getOrNull(2)!!
-    val keyValues = parts.drop(3)
+    val streamKey = parts.getOrNull(1)!!
+    var entryId = parts.getOrNull(2)!!
+    val fieldValues = parts.drop(3)
+    val stream = streamContainer.getOrPut(streamKey) { STREAM() }
+    val autoTimePart = System.currentTimeMillis().toString()
+    val existingAutoSequences = TTEM[autoTimePart]
+    val autoSequenceNum = if (existingAutoSequences.isNullOrEmpty()) {
+        "0"
+    } else {
+        (existingAutoSequences.last().toInt() + 1).toString()
+    }
 
-    val entry = streamContainer.getOrPut(key) { STREAM() }
+    if (entryId == "*") {
+        entryId = "${autoTimePart}-${autoSequenceNum}"
+        TTEM.getOrPut(autoTimePart) { mutableListOf() }.add(autoSequenceNum)
+    } else {
+        val isEntryValid = validateStreamEntryIds(entryId, stream, output)
 
-    if (!validateStreamEntryIds(entryId, entry, output)) return
+        if (!isEntryValid) return
 
-    val entryMap = entry.redisStream.getOrPut(entryId) { mutableMapOf() }
+        val idParts = entryId.split("-")
+        val timePart = idParts[0]
+        val rawSequence = idParts[1]
+        if (rawSequence != "*") TTEM.getOrPut(timePart) { mutableListOf() }.add(rawSequence)
+
+        var sequenceNum = 0
+
+        if (rawSequence == "*") {
+            if (timePart == "0" && TTEM[timePart].isNullOrEmpty()) {
+                sequenceNum = 1
+            } else {
+                val existingSequences = TTEM[timePart]
+                sequenceNum = if (existingSequences.isNullOrEmpty()) 0 else existingSequences.last().toInt() + 1
+            }
+            entryId = "${timePart}-${sequenceNum}"
+            TTEM.getOrPut(timePart) { mutableListOf() }.add(sequenceNum.toString())
+        }
+    }
+
+    val fields = stream.redisStream.getOrPut(entryId) { mutableMapOf() }
+
     var i = 0
-    while (i + 1 < keyValues.size) {
-        entryMap[keyValues[i]] = keyValues[i + 1]
+    while (i + 1 < fieldValues.size) {
+        fields[fieldValues[i]] = fieldValues[i + 1]
         i += 2
     }
 
